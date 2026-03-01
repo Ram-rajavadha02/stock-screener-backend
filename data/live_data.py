@@ -4,15 +4,15 @@ Live OHLCV data via yfinance (Yahoo Finance).
 Stock universe: ALL active NSE EQ-series equities (~2200 stocks), fetched
 dynamically from the NSE archives CSV on first use (cached daily).
 
-OHLCV history is downloaded in parallel batches and cached in-process for
-CACHE_TTL_SECONDS so repeated scans are instant.
+OHLCV history is downloaded in parallel using a thread pool and cached
+in-process for CACHE_TTL_SECONDS so repeated scans are instant.
 
-First load (cold start) may take 3–8 minutes on the free tier — this is
-normal. Call preload_background() at server startup to begin warming the
-cache immediately so scans are fast when the user first connects.
+Timings (approx, depends on network):
+  Symbol list refresh  :  ~1 s   (once per day)
+  First OHLCV fetch    :  ~45 s  (all ~2200 stocks, 30 parallel workers)
+  Subsequent scans     :  instant (served from in-memory cache)
 """
 import time
-import threading
 import requests
 import pandas as pd
 import yfinance as yf
@@ -27,6 +27,7 @@ _NSE_CSV_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
+# Fallback list used if the NSE CSV is unreachable
 _FALLBACK_SYMBOLS: list[tuple[str, str]] = [
     ("RELIANCE",   "RELIANCE.NS"), ("TCS",        "TCS.NS"),
     ("INFY",       "INFY.NS"),     ("HDFCBANK",   "HDFCBANK.NS"),
@@ -58,13 +59,17 @@ _SYMBOL_TTL = 86_400  # 24 hours
 
 
 def _get_nse_symbols() -> list[tuple[str, str]]:
+    """Return all active NSE EQ-series stocks as (display_name, yahoo_ticker) pairs."""
     global _symbols, _symbols_ts
+
     if _symbols and (time.time() - _symbols_ts) < _SYMBOL_TTL:
         return _symbols
+
     try:
         resp = requests.get(_NSE_EQUITY_CSV, headers=_NSE_CSV_HEADERS, timeout=15)
         resp.raise_for_status()
         df = pd.read_csv(StringIO(resp.text))
+        # Normalise column names (NSE CSV has leading/trailing spaces)
         df.columns = [c.strip() for c in df.columns]
         eq = df[df["SERIES"].str.strip() == "EQ"]["SYMBOL"].dropna()
         result = [(s.strip(), f"{s.strip()}.NS") for s in eq.tolist()]
@@ -75,146 +80,72 @@ def _get_nse_symbols() -> list[tuple[str, str]]:
             return result
     except Exception as exc:
         print(f"[live_data] Could not fetch NSE symbol list: {exc}")
+
     print("[live_data] Using fallback symbol list.")
     return _FALLBACK_SYMBOLS
 
 
 # ── OHLCV download ────────────────────────────────────────────────────────────
 
-HISTORY_PERIOD    = "1y"   # 1 year ≈ 252 bars for RSI Wilder warmup
-CACHE_TTL_SECONDS = 3600   # 1-hour cache — re-download once per hour
-BATCH_SIZE        = 100    # tickers per yf.download() call
-MAX_WORKERS       = 15     # parallel batch downloads
+HISTORY_PERIOD    = "1y"    # 1 year ≈ 252 bars — needed for RSI Wilder warmup + SMA-200
+CACHE_TTL_SECONDS = 3600    # 1 hour — daily data doesn't change intraday
+MAX_WORKERS       = 30      # parallel yfinance connections
 
-_cache:     dict[str, pd.DataFrame] = {}
-_cache_ts:  float = 0.0
-_load_lock  = threading.Lock()   # only one download runs at a time
+_cache:    dict[str, pd.DataFrame] = {}
+_cache_ts: float = 0.0
 
 
 def _normalise(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [c.lower() for c in df.columns]
-    if "close" not in df.columns:
-        return pd.DataFrame()
-    df = df[[c for c in ["open", "high", "low", "close", "volume"] if c in df.columns]]
+    df = df[["open", "high", "low", "close", "volume"]]
     df.index = pd.to_datetime(df.index).tz_localize(None)
     df.sort_index(inplace=True)
     return df.dropna(how="all")
 
 
-def _fetch_batch(batch: list[tuple[str, str]]) -> dict[str, pd.DataFrame]:
-    """Download a batch of tickers in one yf.download() call."""
-    if not batch:
-        return {}
-    names_map = {ticker: name for name, ticker in batch}
-    tickers   = [t for _, t in batch]
+def _fetch_one(name: str, ticker: str) -> tuple[str, pd.DataFrame | None]:
+    """Download one stock — executed in a thread-pool worker."""
     try:
-        raw = yf.download(
-            tickers,
-            period=HISTORY_PERIOD,
-            group_by="ticker",
-            auto_adjust=True,
-            progress=False,
-            threads=True,
-        )
+        raw = yf.Ticker(ticker).history(period=HISTORY_PERIOD)
         if raw.empty:
-            return {}
-        result = {}
-        if len(tickers) == 1:
-            df = _normalise(raw)
-            if not df.empty:
-                result[names_map[tickers[0]]] = df
-        else:
-            for ticker in tickers:
-                try:
-                    sub = raw[ticker].copy()
-                    if sub.empty or sub.isna().all().all():
-                        continue
-                    df = _normalise(sub)
-                    if not df.empty:
-                        result[names_map[ticker]] = df
-                except (KeyError, Exception):
-                    pass
-        return result
-    except Exception as exc:
-        print(f"[live_data] Batch error: {exc}")
-        return {}
-
-
-def _run_full_download() -> dict[str, pd.DataFrame]:
-    """Download all NSE stocks. Blocks until every batch is done — no timeout."""
-    symbols = _get_nse_symbols()
-    total   = len(symbols)
-    batches = [symbols[i:i + BATCH_SIZE] for i in range(0, total, BATCH_SIZE)]
-    print(f"[live_data] Downloading {total} stocks in {len(batches)} batches "
-          f"({MAX_WORKERS} workers) …")
-    t0 = time.time()
-
-    fresh: dict[str, pd.DataFrame] = {}
-    done_count = 0
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futures = {pool.submit(_fetch_batch, b): i for i, b in enumerate(batches)}
-        for future in as_completed(futures):
-            done_count += 1
-            try:
-                fresh.update(future.result())
-            except Exception:
-                pass
-            if done_count % 5 == 0 or done_count == len(batches):
-                print(f"  … {done_count}/{len(batches)} batches done, "
-                      f"{len(fresh)} stocks so far ({time.time()-t0:.0f}s)")
-
-    elapsed = time.time() - t0
-    print(f"[live_data] Download complete: {len(fresh)}/{total} stocks in {elapsed:.1f}s.")
-    return fresh
+            return name, None
+        return name, _normalise(raw)
+    except Exception:
+        return name, None
 
 
 def get_all_live_data(force_refresh: bool = False) -> dict[str, pd.DataFrame]:
-    """
-    Return OHLCV data for all NSE stocks.
-
-    Thread-safe: if two requests arrive simultaneously while the cache is
-    cold, only ONE download runs; the second waits for the lock and then
-    returns the freshly-populated cache.
-    """
     global _cache, _cache_ts
 
-    # Fast path — cache is warm
-    if _cache and not force_refresh and (time.time() - _cache_ts) < CACHE_TTL_SECONDS:
+    age = time.time() - _cache_ts
+    if _cache and not force_refresh and age < CACHE_TTL_SECONDS:
         return _cache
 
-    # Slow path — acquire lock so only one thread downloads at a time
-    with _load_lock:
-        # Re-check inside the lock (another thread may have just finished)
-        if _cache and not force_refresh and (time.time() - _cache_ts) < CACHE_TTL_SECONDS:
-            return _cache
+    symbols = _get_nse_symbols()
+    total   = len(symbols)
+    print(f"[live_data] Downloading {total} NSE stocks "
+          f"({MAX_WORKERS} parallel workers, period={HISTORY_PERIOD}) …")
+    t0 = time.time()
 
-        fresh = _run_full_download()
-        if fresh:
-            _cache    = fresh
-            _cache_ts = time.time()
-        else:
-            print("[live_data] No data fetched — keeping previous cache.")
+    fresh: dict[str, pd.DataFrame] = {}
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = {pool.submit(_fetch_one, n, t): n for n, t in symbols}
+        done = 0
+        for future in as_completed(futures):
+            name, df = future.result()
+            done += 1
+            if df is not None:
+                fresh[name] = df
+            if done % 200 == 0:
+                print(f"  … {done}/{total} done")
+
+    elapsed = time.time() - t0
+    if fresh:
+        _cache    = fresh
+        _cache_ts = time.time()
+        print(f"[live_data] Ready: {len(fresh)}/{total} stocks cached in {elapsed:.1f}s.")
+    else:
+        print("[live_data] No data fetched — keeping previous cache.")
 
     return _cache
-
-
-def preload_background() -> None:
-    """
-    Kick off a background thread to warm the cache at server startup.
-    Returns immediately; download continues in the background.
-    """
-    def _load():
-        try:
-            get_all_live_data()
-        except Exception as exc:
-            print(f"[live_data] Background preload failed: {exc}")
-
-    age = time.time() - _cache_ts
-    if _cache and age < CACHE_TTL_SECONDS:
-        print("[live_data] Cache already warm — skipping preload.")
-        return
-
-    t = threading.Thread(target=_load, daemon=True, name="live-data-preload")
-    t.start()
-    print("[live_data] Background preload started.")

@@ -13,31 +13,19 @@ Every endpoint accepts an optional query parameter:
 Example:
     POST /api/screen?live=true
 """
-from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from data.mock_data import get_all_stock_data, STOCKS
-from data.live_data import get_all_live_data, preload_background
+from data.live_data import get_all_live_data
 from models.schemas import ScreenRequest, ScreenResponse
 from screener.engine import ScreenerEngine
 from indicators.calculator import get_series
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Warm the live-data cache in the background as soon as the server starts.
-    # By the time a user sends their first scan, the download will have
-    # progressed (or completed), making the scan much faster.
-    preload_background()
-    yield
-
 
 app = FastAPI(
     title="Stock Screener API",
     description="Chartink-style screening engine — supports mock & live NSE data",
     version="2.0.0",
-    lifespan=lifespan,
 )
 
 app.add_middleware(
