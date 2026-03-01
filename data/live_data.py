@@ -4,20 +4,15 @@ Live OHLCV data via yfinance (Yahoo Finance).
 Stock universe: ALL active NSE EQ-series equities (~2200 stocks), fetched
 dynamically from the NSE archives CSV on first use (cached daily).
 
-OHLCV history is downloaded in parallel using a thread pool and cached
+OHLCV history is downloaded in batches using yf.download() and cached
 in-process for CACHE_TTL_SECONDS so repeated scans are instant.
-
-Timings (approx, depends on network):
-  Symbol list refresh  :  ~1 s   (once per day)
-  First OHLCV fetch    :  ~45 s  (all ~2200 stocks, 30 parallel workers)
-  Subsequent scans     :  instant (served from in-memory cache)
 """
 import time
 import requests
 import pandas as pd
 import yfinance as yf
 from io import StringIO
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
 
 # ── NSE equity list ───────────────────────────────────────────────────────────
 
@@ -69,7 +64,6 @@ def _get_nse_symbols() -> list[tuple[str, str]]:
         resp = requests.get(_NSE_EQUITY_CSV, headers=_NSE_CSV_HEADERS, timeout=15)
         resp.raise_for_status()
         df = pd.read_csv(StringIO(resp.text))
-        # Normalise column names (NSE CSV has leading/trailing spaces)
         df.columns = [c.strip() for c in df.columns]
         eq = df[df["SERIES"].str.strip() == "EQ"]["SYMBOL"].dropna()
         result = [(s.strip(), f"{s.strip()}.NS") for s in eq.tolist()]
@@ -85,11 +79,13 @@ def _get_nse_symbols() -> list[tuple[str, str]]:
     return _FALLBACK_SYMBOLS
 
 
-# ── OHLCV download ────────────────────────────────────────────────────────────
+# ── OHLCV batch download ──────────────────────────────────────────────────────
 
-HISTORY_PERIOD    = "1y"    # 1 year ≈ 252 bars — needed for RSI Wilder warmup + SMA-200
-CACHE_TTL_SECONDS = 3600    # 1 hour — daily data doesn't change intraday
-MAX_WORKERS       = 30      # parallel yfinance connections
+HISTORY_PERIOD   = "1y"   # 1 year ≈ 252 bars — needed for RSI Wilder warmup
+CACHE_TTL_SECONDS = 3600  # 1 hour
+BATCH_SIZE       = 200    # tickers per yf.download() call
+MAX_WORKERS      = 10     # parallel batch downloads
+DOWNLOAD_TIMEOUT = 180    # seconds — return whatever finished within this time
 
 _cache:    dict[str, pd.DataFrame] = {}
 _cache_ts: float = 0.0
@@ -98,21 +94,55 @@ _cache_ts: float = 0.0
 def _normalise(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [c.lower() for c in df.columns]
+    needed = [c for c in ["open", "high", "low", "close", "volume"] if c in df.columns]
+    if not needed or "close" not in needed:
+        return pd.DataFrame()
     df = df[["open", "high", "low", "close", "volume"]]
     df.index = pd.to_datetime(df.index).tz_localize(None)
     df.sort_index(inplace=True)
     return df.dropna(how="all")
 
 
-def _fetch_one(name: str, ticker: str) -> tuple[str, pd.DataFrame | None]:
-    """Download one stock — executed in a thread-pool worker."""
+def _fetch_batch(batch: list[tuple[str, str]]) -> dict[str, pd.DataFrame]:
+    """Download a batch of tickers in one yf.download() call."""
+    if not batch:
+        return {}
+    names_map = {ticker: name for name, ticker in batch}
+    tickers = [t for _, t in batch]
     try:
-        raw = yf.Ticker(ticker).history(period=HISTORY_PERIOD)
+        raw = yf.download(
+            tickers,
+            period=HISTORY_PERIOD,
+            group_by="ticker",
+            auto_adjust=True,
+            progress=False,
+            threads=True,
+        )
         if raw.empty:
-            return name, None
-        return name, _normalise(raw)
-    except Exception:
-        return name, None
+            return {}
+
+        result = {}
+        if len(tickers) == 1:
+            # Single ticker: flat DataFrame
+            df = _normalise(raw)
+            if not df.empty:
+                result[names_map[tickers[0]]] = df
+        else:
+            # Multiple tickers: MultiIndex columns (ticker, price_type)
+            for ticker in tickers:
+                try:
+                    sub = raw[ticker].copy()
+                    if sub.empty or sub.isna().all().all():
+                        continue
+                    df = _normalise(sub)
+                    if not df.empty:
+                        result[names_map[ticker]] = df
+                except (KeyError, Exception):
+                    pass
+        return result
+    except Exception as exc:
+        print(f"[live_data] Batch download error: {exc}")
+        return {}
 
 
 def get_all_live_data(force_refresh: bool = False) -> dict[str, pd.DataFrame]:
@@ -124,21 +154,28 @@ def get_all_live_data(force_refresh: bool = False) -> dict[str, pd.DataFrame]:
 
     symbols = _get_nse_symbols()
     total   = len(symbols)
-    print(f"[live_data] Downloading {total} NSE stocks "
-          f"({MAX_WORKERS} parallel workers, period={HISTORY_PERIOD}) …")
+    batches = [symbols[i:i + BATCH_SIZE] for i in range(0, total, BATCH_SIZE)]
+    print(f"[live_data] Downloading {total} NSE stocks in {len(batches)} batches "
+          f"({MAX_WORKERS} parallel, period={HISTORY_PERIOD}) …")
     t0 = time.time()
 
     fresh: dict[str, pd.DataFrame] = {}
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futures = {pool.submit(_fetch_one, n, t): n for n, t in symbols}
-        done = 0
-        for future in as_completed(futures):
-            name, df = future.result()
-            done += 1
-            if df is not None:
-                fresh[name] = df
-            if done % 200 == 0:
-                print(f"  … {done}/{total} done")
+        futures = [pool.submit(_fetch_batch, b) for b in batches]
+        done, pending = futures_wait(futures, timeout=DOWNLOAD_TIMEOUT)
+
+        for f in done:
+            try:
+                fresh.update(f.result())
+            except Exception:
+                pass
+
+        if pending:
+            print(f"[live_data] Timeout after {DOWNLOAD_TIMEOUT}s — "
+                  f"{len(pending)} batch(es) cancelled, "
+                  f"{len(fresh)} stocks collected so far.")
+            for f in pending:
+                f.cancel()
 
     elapsed = time.time() - t0
     if fresh:
